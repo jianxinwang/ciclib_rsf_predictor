@@ -1,3 +1,4 @@
+# This script is for biomarker paper 2
 library(AIMS)
 library(org.Hs.eg.db)
 library(randomForestSRC)
@@ -10,6 +11,7 @@ library(ggpubr)
 library(GEOquery)
 library(ComplexHeatmap)
 library(dplyr)
+library(circlize)
 
 date <- Sys.Date()
 project <- 'RandomForestSRC'
@@ -18,44 +20,52 @@ setwd("/mnt/Jason/HTG/data")
 
 source('/mnt/Jason/HTG/scripts/mk.KM.plot.R')
 
-dta <- read.csv("all.norm.htg+clinical.batch.1-5.edgeR.csv", stringsAsFactors = TRUE)
+dta <- read.csv("/mnt/Jason/HTG/data/all.norm.htg+clinical.csv", stringsAsFactors = TRUE)
 
-rownames(dta) <- paste(dta$pcode, dta$Block, dta$Timepoint, dta$Organ, sep = '|')
+# newSurvival <- read.csv('/mnt/Jason/HTG/data/Updated_PFS_04292024.csv')
+# 
+# # Update censored data
+# newSurvival$pfs_time[newSurvival$true.progression == 0] <- newSurvival$pfs_time[newSurvival$true.progression == 0] + 7.594
+
+rownames(dta) <- paste(dta$pcode,  dta$Timepoint, dta$Organ, dta$Block, sep = '.')
+
 dta <- dta[dta$drug %in% c('AI', 'Fulvestrant'), ]
 
-# only use pretreatment samples
+# P97.2.Soft.Tissue.A3 is missing in the raw data file. Must have a reason to be removed by Emily
+#dta <- dta[!rownames(dta) %in% c('P97.2.Soft.Tissue.A3'), ]
+
+# only use pre-treatment samples. Some pcode provided more than one biopsies for sequencing,
+# we will keep them to increase our training dataset size
 dtaPretx <- dta[grepl("2", dta$Timepoint), ]
 
-# remove rows with more than one biopsies from a single patient
-dtaPretx <- dtaPretx[!duplicated(dtaPretx$pcode), ]
 
 
-
-set.seed(420)
-
+# Set a color pallete for plotting use
 colors <- c('#ffe119', '#3cb44b', '#e6194b', '#4363d8', '#f58231', 
             '#911eb4', '#46f0f0', '#f032e6', '#bcf60c', '#fabebe', 
             '#008080', '#e6beff', '#9a6324', '#fffac8', '#800000', 
             '#aaffc3', '#808000', '#ffd8b1', '#000075', '#808080', 
             '#ffffff', '#000000')
 
-resList <- list()
 
 # use published biomarkers for feature selection
 biomarker <- list(
-    CDK2 = "../data/biomarkers/CDK2_signature.txt",
-    OncotypeDX = "../data/biomarkers/OncotypeDX.txt",
-    IHC4 = "../data/biomarkers/IHC4.txt",
-    RBSig =  "../data/biomarkers/RBsig.txt",
-    PAM50 = "../data/biomarkers/PAM50.txt",
-    EndoPredict = "../data/biomarkers/EndoPredict.txt",
-    Mammaprint = "../data/biomarkers/Mammaprint.txt",
-    Mammostrat = "../data/biomarkers/Mammostrat.txt",
-    Proliferation = "../data/biomarkers/ProliferationSignatureByCharlesPerou.txt",
-    G2M_Checkpoint = "../data/biomarkers/G2M_Checkpoint.txt",
-    ElasticNetSignature = "../data/biomarkers/ElasticNetSignature.txt",
-    CDK46 = "../data/biomarkers/CDK4_6_GeneList.txt",
-    BCI = "../data/biomarkers/BCI.txt"
+    PALOMA3 = './biomarkers/PALOMA3.txt',
+    PALOMA23 = './biomarkers/PALOMA2-3_merged.txt',
+    PEARL = './biomarkers/PEARL.txt',
+    CDK2 = "./biomarkers/CDK2_signature.txt",
+    OncotypeDX = "./biomarkers/OncotypeDX.txt",
+    IHC4 = "./biomarkers/IHC4.txt",
+    RBSig =  "./biomarkers/RBsig.txt",
+    PAM50 = "./biomarkers/PAM50.txt",
+    EndoPredict = "./biomarkers/EndoPredict.txt",
+    Mammaprint = "./biomarkers/Mammaprint.txt",
+    Mammostrat = "./biomarkers/Mammostrat.txt",
+    Proliferation = "./biomarkers/ProliferationSignatureByCharlesPerou.txt",
+    G2M_Checkpoint = "./biomarkers/G2M_Checkpoint.txt",
+    ElasticNetSignature = "./biomarkers/ElasticNetSignature.txt",
+    CDK46 = "./biomarkers/CDK4_6_GeneList.txt",
+    BCI = "./biomarkers/BCI.txt"
 )
 
 biomarkerList <- list()
@@ -66,14 +76,22 @@ for (name in names(biomarker)){
     biomarkerList[[name]] <- markerDf$V1
 }
 
-vimp <- NULL
+setwd("/mnt/Jason/HTG/output/RandomForests")
 
-setwd("../output/RandomForests")
+
+
+
+vimp1 <- NULL
 
 ##=======================================================================================
 ## Round 1, initial biomarker evaluation
 ##=======================================================================================
 # loop through each biomarker and perform feature selection
+
+
+bestModelList.r1 <- list()
+
+
 for (marker in names(biomarkerList)){
     genes.of.interest <- biomarkerList[[marker]]
     
@@ -86,40 +104,60 @@ for (marker in names(biomarkerList)){
     
     dtaSubset <- cbind(dtaPretx[, c(2,4)], tmp)
     
-    # tune mtry and node size
-    o1 <- tune(Surv(pfs_time, true.progression) ~ ., dtaSubset)
+    set.seed(420)
+    min.cindex <- 1
+    bestModel.r1 <- NULL
     
-    obj.src <- rfsrc(Surv(pfs_time, true.progression) ~ ., dtaSubset, ntree = 1000, importance = TRUE, mtry = o1[[2]][[2]], node.size = o1[[2]][[1]], na.action = "na.impute")
-    sink(file = paste(date, project, 'myoutput1.txt', sep = '_'), append = TRUE, type = 'output')
-    print(marker)
-    print(obj.src)
-    sink()
+    for (i in 1:10){
+      # tune mtry and node size
+      o1 <- tune(Surv(pfs_time, true.progression) ~ ., dtaSubset)
+      
+      set.seed(420)
+      obj.src <- rfsrc(Surv(pfs_time, true.progression) ~ ., dtaSubset, ntree = 1000, importance = TRUE, mtry = o1[[2]][[2]], node.size = o1[[2]][[1]], na.action = "na.impute")
+      
+      sink(file = paste(date, project, marker, 'round1_run', i, 'traing_stats.txt', sep = '_'), append = FALSE, type = 'output')
+      print(marker)
+      print(obj.src)
+      sink()
+      
+      # get OOB perforance error for best model selection
+      cindex <- get.cindex(time = dtaSubset$pfs_time, censoring = dtaSubset$true.progression,
+                           predicted = obj.src$predicted.oob)
+      
+      if (cindex < min.cindex){
+        min.cindex <- cindex
+        bestModel.r1 <- obj.src
+      }
+    }
+    
+    bestModelList.r1[[marker]] <- bestModel.r1
     
     # get variable importance
-    print(predict(obj.src, importance = TRUE)$importance)
-    
+    print(predict(bestModel.r1, importance = TRUE)$importance)
+
     # plot OOB error rate and variable importance
     png(paste(date, project, marker, "VIM.png", sep = '_'),
         width = 8,
         height = 20,
         units = 'in',
         res = 200)
-    plot(obj.src)
-    
+    plot(bestModel.r1)
+
     dev.off()
-    
-    
+
+
     png(paste(date, project, marker, "Survival.png", sep = '_'),
         width = 10,
         height = 10,
         units = 'in',
         res = 200)
-    plot.survival(rfsrc(Surv(pfs_time, true.progression)~ ., dtaSubset), cens.model = "rfsrc", collapse = F)
+    plot.survival(bestModel.r1, cens.model = "rfsrc", collapse = F)
     dev.off()
     
     
     # variable confidence interval
-    jk.obj <- subsample(obj.src)
+    set.seed(420)
+    jk.obj <- subsample(bestModel.r1)
     
     # adjust plot height dynamicly
     height <- length(idx) * 0.22 + 1.3
@@ -129,16 +167,16 @@ for (marker in names(biomarkerList)){
     par(mar=c(4,6,0,0))
     plot(jk.obj, cex = 0.6)
     dev.off()
-    
+
     
     # VIMP
-    vimpbytreatment <- as.data.frame(vimp(obj.src, block.size = 10, joint = F)$importance)
+    vimpbytreatment <- as.data.frame(vimp(bestModel.r1, block.size = 10, joint = F)$importance)
     colnames(vimpbytreatment) <- "VIMP"
     vimpbytreatment <- vimpbytreatment[order(vimpbytreatment$VIMP, decreasing = TRUE), , drop = FALSE]
     
     # save to file
-    write.table(vimpbytreatment, 
-                file = paste(date, marker, "Vimp.txt", sep = '_'),
+    write.table(vimpbytreatment,
+                file = paste(date, project, marker, "Vimp.txt", sep = '_'),
                 quote = FALSE,
                 col.names = F,
                 sep = "\t"
@@ -148,49 +186,88 @@ for (marker in names(biomarkerList)){
     # Test model performance with K-M plot
     #
     
-    # predict mortality on training dataset
-    obj.predict <- predict(obj.src, dtaSubset)
-    
-    sink(file = paste(date, project, 'myoutput2.txt', sep = '_'), append = TRUE, type = 'output')
-    print(marker)
-    print(obj.predict)
-    sink()
-    
-    yhat <- obj.predict$predicted
-    
-    q.yhat <- quantile(yhat, probs = c(0, 0.5, 1))
-    q.yhat[1] <- q.yhat[1] - .0001
-    Group <- cut(yhat, q.yhat, labels = FALSE)
-    
-    survDf <- cbind(obj.predict$yvar, Group)
-    survDf$Group[survDf$Group == 1] <- 'LowRisk'
-    survDf$Group[survDf$Group == 2] <- 'HighRisk'
-    survDf$Group <- factor(survDf$Group, levels = c('LowRisk', 'HighRisk'))
-    
-    p <- make.KM.plot(survDf = survDf, grouping.var = 'Group', surv.type = 'pfs_time', event = 'true.progression')
-    
-    png(paste(date, project, marker, "Round1_VerificationOfPublishedBioMarkerOnHtgPreTx_K-M_plot.png", sep = '_'),
-        width = 6, 
-        height = 6, 
-        units = "in", 
-        pointsize = 10, 
-        res = 300
-    )
-    print(p)
-    dev.off()
+    for (dg in c("Combined", "AI", "Fulvestrant")){
+      survDf <- bestModel.r1$yvar
+      survDf$OOB_Mortality <- bestModel.r1$predicted.oob
+      survDf$Mortality <- bestModel.r1$predicted
+      
+      if (dg %in% c('AI', 'Fulvestrant')){
+        survDf <- merge(survDf, dtaPretx[, 6, drop = F], by = 0)
+        survDfSubset <- survDf %>% filter(drug == dg)
+      } else {
+        survDfSubset <- survDf
+      }
+      
+      survDfSubset$Group <- ifelse(survDfSubset$OOB_Mortality > median(survDfSubset$OOB_Mortality), 'HighRisk', 'LowRisk')
+      survDfSubset$Group <- factor(survDfSubset$Group, levels = c('LowRisk', 'HighRisk'))
+      
+      km <- make.KM.plot(survDf = survDfSubset, grouping.var = 'Group', surv.type = 'pfs_time',
+                         event = 'true.progression', 
+                         legendLabs = c('LowRisk', 'HighRisk'))
+      
+      png(paste(date, project, marker, dg, "R1_RSFModelPredictedOobSurvival_K-M_plot.png", sep = '_'),
+          height = 6,
+          width = 6,
+          units = 'in',
+          res = 100)
+      print(km)
+      dev.off()
+      
+      # IB data
+      survDfSubset$Group <- ifelse(survDfSubset$Mortality > median(survDfSubset$Mortality), 'HighRisk', 'LowRisk')
+      survDfSubset$Group <- factor(survDfSubset$Group, levels = c('LowRisk', 'HighRisk'))
+      
+      km2 <- make.KM.plot(survDf = survDfSubset, grouping.var = 'Group', surv.type = 'pfs_time',
+                         event = 'true.progression', 
+                         legendLabs = c('LowRisk', 'HighRisk'))
+      
+      png(paste(date, project, marker, dg, "R1_RSFModelPredictedIbSurvival_K-M_plot.png", sep = '_'),
+          height = 6,
+          width = 6,
+          units = 'in',
+          res = 100)
+      print(km2)
+      dev.off()
+      
+    }
     
     # save variables passing VIMP > 0.002 for next round
     tmp <- vimpbytreatment[vimpbytreatment$VIMP > 0.002, , drop = FALSE]
-    vimp <- c(vimp, rownames(tmp))
+    vimp1 <- c(vimp1, rownames(tmp))
 }
 
+for (marker in names(biomarkerList)){
+  bestModel.r1 <- bestModelList.r1[[marker]]
+  
+  survDf <- bestModel.r1$yvar
+  survDf$Mortality <- bestModel.r1$predicted
+  survDf$Group <- ifelse(survDf$Mortality > median(survDf$Mortality), 'HighRisk', 'LowRisk')
+  survDf$Group <- factor(survDf$Group, levels = c('LowRisk', 'HighRisk'))
+  
+  km2 <- make.KM.plot(survDf = survDf, grouping.var = 'Group', surv.type = 'pfs_time',
+                      event = 'true.progression', 
+                      legendLabs = c('LowRisk', 'HighRisk'))
+  
+  png(paste(date, project, marker, "Combined_R1_RSFModelPredictedIbSurvival_K-M_plot.png", sep = '_'),
+      height = 6,
+      width = 6,
+      units = 'in',
+      res = 100)
+  print(km2)
+  dev.off()
+  
+  
+}
+
+
 ##=======================================================================================
-## Round 2, combined the important genes from round1 and repeat random survival modeling
+## Round 2, combine the important genes from round1 and repeat random survival modeling
 ## to further purify important genes
 ##=======================================================================================
-important.genes <- unique(vimp)
+important.genes <- unique(vimp1)
 
 length(important.genes) 
+# 140
 
 # tune mtry and node size
 idx2 <- which(colnames(dtaPretx) %in% important.genes)
@@ -200,425 +277,665 @@ tmp <- t(scale(t(tmp)))
 tmp <- as.data.frame(tmp)
 dtaSubset2 <- cbind(dtaPretx[, c(2,4)], tmp)
 
-o2 <- tune(Surv(pfs_time, true.progression) ~ ., dtaSubset2)
+min.cindex <- 1
+models.r2 <- NULL
 
-obj.src2 <- rfsrc(Surv(pfs_time, true.progression) ~ ., dtaSubset2, ntree = 1000, 
-                  importance = TRUE, mtry = o2[[2]][[2]], node.size = o2[[2]][[1]], 
-                  na.action = "na.impute")
-print(obj.src2)
+# repeat 5 times
+for (i in 1:10){
+
+  o2 <- tune(Surv(pfs_time, true.progression) ~ ., dtaSubset2)
+  
+  obj.src2 <- rfsrc(Surv(pfs_time, true.progression) ~ ., dtaSubset2, ntree = 1000, 
+                    importance = TRUE, mtry = o2[[2]][[2]], node.size = o2[[2]][[1]], 
+                    na.action = "na.impute")
+  print(obj.src2)
+  
+  sink(file = paste(date, project, 'round2_run', i, 'traing_stats.txt', sep = '_'), append = F, type = 'output')
+  print('Round2')
+  print(obj.src2)
+  sink()
+  
+  # get OOB perforance error for best model selection
+  cindex <- get.cindex(time = dtaSubset2$pfs_time, censoring = dtaSubset2$true.progression,
+                       predicted = obj.src2$predicted.oob)
+  #rankings <- c(rankings, cindex)
+  if (cindex < min.cindex){
+    min.cindex <- cindex
+    bestModel.r2 <- obj.src2
+  }
+}
+
+png(paste(date, project, "Round2_Survival.png", sep = '_'),
+    width = 10,
+    height = 10,
+    units = 'in',
+    res = 200)
+rv2 <- plot.survival(bestModel.r2, cens.model = "rfsrc", collapse = F)
+dev.off()
 
 # VIMP
-vimpbytreatment <- as.data.frame(vimp(obj.src2, block.size = 10, joint = F)$importance)
+vimpbytreatment <- as.data.frame(vimp(bestModel.r2, block.size = 10, joint = F)$importance)
 colnames(vimpbytreatment) <- "VIMP"
 
 # get variables passing VIMP > 0.002 for next round
-vimp <- vimpbytreatment[vimpbytreatment$VIMP > 0.002, , drop = FALSE]
+vimp2 <- vimpbytreatment[vimpbytreatment$VIMP > 0.002, , drop = FALSE]
 
-dim(vimp) # 56 1
+dim(vimp2) # 56 1
 
 # variable confidence interval
+set.seed(420)
 jk.obj2 <- subsample(obj.src2)
 
-height <- length(idx2) * 0.16 + 1.3
-png(paste(date, project, "Round2_FilteredFeatureVimpConfidenceInterval.png", sep = '_'), width = 5, height = height, units = 'in', res = 100)
+height <- length(idx2) * 0.1 + 0.5
+png(paste(date, project, "Round2_FilteredFeatureVimpConfidenceInterval.png", sep = '_'), width = 4.5, height = height, units = 'in', res = 100)
 par(oma=c(1,1,1,1))
 par(mar=c(4,6,0,0))
 plot(jk.obj2, cex = 1.2)
 dev.off()
 
-important.genes2 <- rownames(vimp)
+important.genes2 <- rownames(vimp2)
 length(important.genes2)
-#
-# Test model performance with K-M plot
-#
 
-# predict mortality on training dataset
-obj.predict2 <- predict(obj.src2, dtaSubset2)
+# # use the filtered genes to train a new model for later use
+# dtaSubset2.1 <- dtaSubset2[, c('true.progression', 'pfs_time', important.genes2)]
+# set.seed(420)
+# o2.1 <- tune(Surv(pfs_time, true.progression) ~ ., dtaSubset2.1)
+# 
+# set.seed(420)
+# obj.src2.1 <- rfsrc(Surv(pfs_time, true.progression) ~ ., dtaSubset2.1, ntree = 1000, 
+#                   importance = TRUE, mtry = o2.1[[2]][[2]], node.size = o2.1[[2]][[1]], 
+#                   na.action = "na.impute")
+# print(obj.src2.1)
 
-print(obj.predict2)
-yhat <- obj.predict2$predicted
+##################################################################################################
+# Make K-M plot to show the RSF performance by stratify patients with OOB predicted mortality
+##################################################################################################
 
-q.yhat <- quantile(yhat, probs = c(0, 0.5, 1))
-q.yhat[1] <- q.yhat[1] - .0001
-Group <- cut(yhat, q.yhat, labels = FALSE)
+for (dg in c('Combined', 'AI', 'Fulvestrant')){
+  survDf <- bestModel.r2$yvar
+  survDf$OOB_Mortality <- bestModel.r2$predicted.oob
+  survDf$Mortality <- bestModel.r2$predicted
+  
+  if (dg %in% c('AI', 'Fulvestrant')){
+    survDf <- merge(survDf, dtaPretx[, 6, drop = F], by = 0)
+    survDfSubset <- survDf %>% filter(drug == dg)
+  } else {
+    survDfSubset <- survDf
+  }
+  
+  survDfSubset$Group <- ifelse(survDfSubset$OOB_Mortality > median(survDfSubset$OOB_Mortality), 'HighRisk', 'LowRisk')
+  survDfSubset$Group <- factor(survDfSubset$Group, levels = c('LowRisk', 'HighRisk'))
+  
+  km <- make.KM.plot(survDf = survDfSubset, grouping.var = 'Group', surv.type = 'pfs_time',
+                     event = 'true.progression', 
+                     legendLabs = c('LowRisk', 'HighRisk'))
+  
+  png(paste(date, project, dg, "R2_RSFModelPredictedOobSurvival_K-M_plot.png", sep = '_'),
+      height = 6,
+      width = 6,
+      units = 'in',
+      res = 100)
+  print(km)
+  dev.off()
+  
+  #
+  # All sample (IB + OOB)
+  #
+  survDfSubset$Group <- ifelse(survDfSubset$Mortality > median(survDfSubset$Mortality), 'HighRisk', 'LowRisk')
+  survDfSubset$Group <- factor(survDfSubset$Group, levels = c('LowRisk', 'HighRisk'))
+  
+  km2 <- make.KM.plot(survDf = survDfSubset, grouping.var = 'Group', surv.type = 'pfs_time',
+                     event = 'true.progression', 
+                     legendLabs = c('LowRisk', 'HighRisk'))
+  
+  png(paste(date, project, dg, "R2_RSFModelPredictedIbSurvival_K-M_plot.png", sep = '_'),
+      height = 6,
+      width = 6,
+      units = 'in',
+      res = 100)
+  print(km2)
+  dev.off()
+}
 
-survDf <- cbind(obj.predict2$yvar, Group)
-survDf$Group[survDf$Group == 1] <- 'LowRisk'
-survDf$Group[survDf$Group == 2] <- 'HighRisk'
-survDf$Group <- factor(survDf$Group, levels = c('LowRisk', 'HighRisk'))
 
-p <- make.KM.plot(survDf = survDf, grouping.var = 'Group', surv.type = 'pfs_time', event = 'true.progression')
+# save the round2 model for testing in other dataset with no clinical varibles
+#save(obj.src2.1, file = paste(date, project, 'Round2RSFModel.Rdata', sep = '_'))
 
-png(paste(date, project, "Round2_VerificationOfFilteredPublishedBioMarkerOnHtgPreTx_K-M_plot.png", sep = '_'),
-    width = 6, 
-    height = 6, 
-    units = "in", 
-    pointsize = 10, 
-    res = 300
-)
-print(p)
-dev.off()
 
 ##=======================================================================================
 ## Round 3, add clinical variables to the important genes selected from round2 and repeat
 ## random survival modeling to further purify important genes and clinical variables
 ##=======================================================================================
 dtaSubset.cli <- cbind(dtaPretx[, c(2, 4, 6:12, 15)], tmp)
-dtaSubset.cli$Organ <- as.character(dtaSubset.cli$Organ)
-dtaSubset.cli$Organ[!dtaSubset.cli$Organ %in% c('Bone', 'Lung', 'Breast', 'Liver', 'Skin')] <- 'Other'
-dtaSubset.cli$Organ <- as.factor(dtaSubset.cli$Organ)
 
-o3 <- tune(Surv(pfs_time, true.progression) ~ ., dtaSubset.cli)
+# Organ may not be selected in the important feature list, so handle it
+if ('Organ' %in% colnames(dtaSubset.cli)){
+    dtaSubset.cli$Organ <- as.character(dtaSubset.cli$Organ)
+    dtaSubset.cli$Organ[!dtaSubset.cli$Organ %in% c('Bone', 'Lung', 'Breast', 'Liver', 'Skin')] <- 'Other'
+    dtaSubset.cli$Organ <- as.factor(dtaSubset.cli$Organ)
+}
 
-obj.src3 <- rfsrc(Surv(pfs_time, true.progression) ~ ., dtaSubset.cli, ntree = 1000, 
-                  importance = TRUE, mtry = o3[[2]][[2]], node.size = o3[[2]][[1]], 
-                  na.action = "na.impute")
-print(obj.src3)
+min.cindex <- 1
+models.r3 <- NULL
 
-# VIMP
-vimpbytreatment <- as.data.frame(vimp(obj.src3, block.size = 10, joint = F)$importance)
-colnames(vimpbytreatment) <- "VIMP"
+# repeat 5 times
+for (i in 1:10){
+  o3 <- tune(Surv(pfs_time, true.progression) ~ ., dtaSubset.cli)
 
-#
-# Test model performance with K-M plot
-#
+  obj.src3 <- rfsrc(Surv(pfs_time, true.progression) ~ ., dtaSubset.cli, ntree = 1000, 
+                    importance = TRUE, mtry = o3[[2]][[2]], node.size = o3[[2]][[1]], 
+                    na.action = "na.impute")
+  print(obj.src3)
+  sink(file = paste(date, project, 'round3_run', i, 'traing_stats.txt', sep = '_'), append = F, type = 'output')
+  print('Round3')
+  print(obj.src3)
+  sink()
+  
+  # get OOB perforance error for best model selection
+  cindex <- get.cindex(time = dtaSubset.cli$pfs_time, censoring = dtaSubset.cli$true.progression,
+                       predicted = obj.src3$predicted.oob)
+  #rankings <- c(rankings, cindex)
+  if (cindex < min.cindex){
+    min.cindex <- cindex
+    bestModel.r3 <- obj.src3
+  }
+}
 
-# predict mortality on training dataset
-obj.predict3 <- predict(obj.src3, dtaSubset.cli)
 
-print(obj.predict)
-yhat <- obj.predict$predicted
-
-q.yhat <- quantile(yhat, probs = c(0, 0.5, 1))
-q.yhat[1] <- q.yhat[1] - .0001
-Group <- cut(yhat, q.yhat, labels = FALSE)
-
-survDf <- cbind(obj.predict$yvar, Group)
-survDf$Group[survDf$Group == 1] <- 'LowRisk'
-survDf$Group[survDf$Group == 2] <- 'HighRisk'
-survDf$Group <- factor(survDf$Group, levels = c('LowRisk', 'HighRisk'))
-
-p <- make.KM.plot(survDf = survDf, grouping.var = 'Group', surv.type = 'pfs_time', event = 'true.progression')
-
-png(paste(date, project, "Round3_VerificationOfFilteredPublishedBioMarkerPlusClinicalCovariatesOnHtgPreTx_K-M_plot.png", sep = '_'),
-    width = 6, 
-    height = 6, 
-    units = "in", 
-    pointsize = 10, 
-    res = 300
-)
-print(p)
+png(paste(date, project, "Round3_Survival.png", sep = '_'),
+    width = 10,
+    height = 10,
+    units = 'in',
+    res = 200)
+rv3 <- plot.survival(bestModel.r3, cens.model = "rfsrc", collapse = F)
 dev.off()
 
-# get variables passing VIMP > 0.002 for next round use
-vimp <- vimpbytreatment[vimpbytreatment$VIMP > 0.002, , drop = FALSE]
-dim(vimp)
+# VIMP
+vimpbytreatment <- as.data.frame(vimp(bestModel.r3, block.size = 10, joint = F)$importance)
+colnames(vimpbytreatment) <- "VIMP"
 
-rownames(vimp)
+# get variables passing VIMP > 0.002 for next round use
+vimp3 <- vimpbytreatment[vimpbytreatment$VIMP > 0.002, , drop = FALSE]
+dim(vimp3)
+
+important.features3 <- rownames(vimp3)
+
+# 
 # variable confidence interval
-jk.obj3 <- subsample(obj.src3)
-height <- length(idx2) * 0.16 + 1.3
-png(paste(date, project, "Round3_FilteredFeatureVimpConfidenceInterval.png", sep = '_'), width = 5, height = height, units = 'in', res = 100)
+set.seed(420)
+jk.obj3 <- subsample(bestModel.r3)
+height <- length(idx2) * 0.07 + 0.2
+png(paste(date, project, "R3_VimpConfidenceInterval.png", sep = '_'), width = 4.5, height = height, units = 'in', res = 100)
 par(oma=c(1,1,1,1))
 par(mar=c(4,6,0,0))
 plot(jk.obj3, cex = 1.2)
 dev.off()
 
+
+##################################################################################################
+# Make K-M plot to show the RSF performance by stratify patients with OOB predicted mortality
+##################################################################################################
+
+for (dg in c('Combined', 'AI', 'Fulvestrant')){
+  survDf <- bestModel.r3$yvar
+  survDf$OOB_Mortality <- bestModel.r3$predicted.oob
+  survDf$Mortality <- bestModel.r3$predicted
+  
+  if (dg %in% c('AI', 'Fulvestrant')){
+    survDf <- merge(survDf, bestModel.r3$xvar[, 1, drop = FALSE], by = 0)
+    survDfSubset <- survDf %>% filter(drug == dg)
+  } else {
+    survDfSubset <- survDf
+  }
+  
+  survDfSubset$Group <- ifelse(survDfSubset$OOB_Mortality > median(survDfSubset$OOB_Mortality), 'HighRisk', 'LowRisk')
+  survDfSubset$Group <- factor(survDfSubset$Group, levels = c('LowRisk', 'HighRisk'))
+  
+  km <- make.KM.plot(survDf = survDfSubset, grouping.var = 'Group', surv.type = 'pfs_time',
+                     event = 'true.progression', 
+                     legendLabs = c('LowRisk', 'HighRisk'))
+  
+  png(paste(date, project, dg, "R3_RSFModelPredictedOobSurvival_K-M_plot.png", sep = '_'),
+      height = 6,
+      width = 6,
+      units = 'in',
+      res = 100)
+  print(km)
+  dev.off()
+  
+  # IB data 
+  survDfSubset$Group <- ifelse(survDfSubset$Mortality > median(survDfSubset$Mortality), 'HighRisk', 'LowRisk')
+  survDfSubset$Group <- factor(survDfSubset$Group, levels = c('LowRisk', 'HighRisk'))
+  
+  km <- make.KM.plot(survDf = survDfSubset, grouping.var = 'Group', surv.type = 'pfs_time',
+                     event = 'true.progression', 
+                     legendLabs = c('LowRisk', 'HighRisk'))
+  
+  png(paste(date, project, dg, "R3_RSFModelPredictedIbSurvival_K-M_plot.png", sep = '_'),
+      height = 6,
+      width = 6,
+      units = 'in',
+      res = 100)
+  print(km)
+  dev.off()
+}
+
+
 ##=======================================================================================
-## Round 4, repeat random survival modeling to verify features selected
+## Round 4, repeat random survival modeling to verify features selected and further
+## eliminate less important features
 ##=======================================================================================
-dtaSubset.cli2 <- cbind(dtaSubset.cli[, 1:2], dtaSubset.cli[, rownames(vimp)])
+dtaSubset.cli2 <- dtaSubset.cli[, c('true.progression', 'pfs_time', important.features3)]
 
 # due to the algorithmic nature of random forest, each time a tree is built, a slightly
 # different vimp list is returned. If multiple features have similar resolving power, they
 # may have different vimp values. However, the strongest feature should always the same.
-# We repeat this process 100 times and then tabulate the frequencies of each feature being
-# in the final vimp list
-for (i in 1:2){
+# We will run the below code black five times and pick the best model (with the lowest OOB
+# error)
+
+bestModel.r4 <- NULL
+min.cindex <- 1
+
+for (i in 1:10){ # repeat 5 times
+   # set.seed(420)
     o4 <- tune(Surv(pfs_time, true.progression) ~ ., dtaSubset.cli2)
     
+  #  set.seed(420)
     obj.src4 <- rfsrc(Surv(pfs_time, true.progression) ~ ., dtaSubset.cli2, ntree = 1000, 
                       importance = TRUE, mtry = o4[[2]][[2]], node.size = o4[[2]][[1]], 
                       na.action = "na.impute")
     print(obj.src4)
+    sink(file = paste(date, project, 'round4_run', i, 'traing_stats.txt', sep = '_'), append = F, type = 'output')
+    print("Round4")
+    print(obj.src4)
+    sink()
     
-    # VIMP
-    vimpbytreatment <- as.data.frame(vimp(obj.src4, block.size = 10, joint = F)$importance)
-    colnames(vimpbytreatment) <- "VIMP"
-    
-    # save variables passing VIMP > 0.002. This should have no effect
-    vimp <- vimpbytreatment[vimpbytreatment$VIMP > 0.002, , drop = FALSE]
-    dim(vimp)
-    final.features <- rownames(vimp)
-    
-    # variable confidence interval
-    jk.obj <- subsample(obj.src4)
-    height <- nrow(vimp) * 0.24 + 1.3
-    png(paste(date, project, i, "Round4_DoublelyFilteredFeatureVimpConfidenceInterval.png", sep = '_'), width = 5, height = height, units = 'in', res = 100)
-    par(oma=c(1,1,1,1))
-    par(mar=c(4,6,2,2) + 0.1)
-    plot(jk.obj, cex = 1.2)
-    dev.off()
-    
-    # save to file
-    write.table(x = vimp,
-                file = paste(date, project, i, 'FinalFeaturesFromRound4.txt', sep = '_'),
-                quote = FALSE,
-                sep = "\t",
-                row.names = TRUE)
-    
+    # get OOB perforance error for best model selection
+    cindex <- get.cindex(time = dtaSubset.cli2$pfs_time, censoring = dtaSubset.cli2$true.progression,
+               predicted = obj.src4$predicted.oob)
+    #rankings <- c(rankings, cindex)
+    if (cindex < min.cindex){
+      min.cindex <- cindex
+      bestModel.r4 <- obj.src4
+    }
 }
 
-#
-# Looks good and use obj.src4 as the final model for prediction
-#
-
-# save the final model
-save(obj.src4, file = 'FinalRSFModel.Rdata')
-
-##===========================================================================================
-## verify on the same(training) dataset
-##===========================================================================================
-
-# predict mortality on training dataset
-obj.predict4 <- predict(obj.src4, dtaSubset.cli2)
-
-print(obj.predict4)
-yhat <- obj.predict4$predicted
-
-q.yhat <- quantile(yhat, probs = c(0, 0.5, 1))
-q.yhat[1] <- q.yhat[1] - .0001
-Group <- cut(yhat, q.yhat, labels = FALSE)
-
-survDf <- cbind(obj.predict4$yvar, Group)
-survDf$Group[survDf$Group == 1] <- 'LowRisk'
-survDf$Group[survDf$Group == 2] <- 'HighRisk'
-survDf$Group <- factor(survDf$Group, levels = c('LowRisk', 'HighRisk'))
-
-p <- make.KM.plot(survDf = survDf, grouping.var = 'Group', surv.type = 'pfs_time', event = 'true.progression')
-
-png(paste(date, project, "TestOfFinalModelOnHtgPreTx_PFS_K-M_plot.png", sep = '_'),
-    width = 6, 
-    height = 6, 
-    units = "in", 
-    pointsize = 10, 
-    res = 300
-)
-print(p)
+# 
+# variable confidence interval
+#set.seed(420)
+jk.obj4 <- subsample(bestModel.r4)
+height <- length(idx2) * 0.07 + 0.2
+png(paste(date, project, "R4_VimpConfidenceInterval.png", sep = '_'), width = 4.5, height = height, units = 'in', res = 100)
+par(oma=c(1,1,1,1))
+par(mar=c(4,6,0,0))
+plot(jk.obj3, cex = 1.2)
 dev.off()
 
-# OS
-survDf2 <- merge(survDf, dta[, c('os', 'precdk_os_time')], by = 0)
-p <- make.KM.plot(survDf = survDf2, grouping.var = 'Group', surv.type = 'precdk_os_time', event = 'os')
+##############################################################################################
+# Plot predicted survival function dichotomize wit OOB predicted mortality
+##############################################################################################
+pred.surv =  as.data.frame(t(bestModel.r4$survival.oob))
+colnames(pred.surv) <- rownames(bestModel.r4$xvar)
+pred.surv$Time <- bestModel.r4$time.interest
 
-png(paste(date, project, "TestOfFinalModelOnHtgPreTx_OS_K-M_plot.png", sep = '_'),
-    width = 6, 
-    height = 6, 
-    units = "in", 
-    pointsize = 10, 
-    res = 300
-)
+dd = melt(pred.surv, id=c("Time"))
+colnames(dd) <- c('Time', 'PID', 'Survival')
+
+mortality <- data.frame(Mortality = bestModel.r4$predicted.oob)
+mortality$Risk <- ifelse(mortality$Mortality > median(mortality$Mortality), 'High', 'Low')
+rownames(mortality) <- rownames(bestModel.r4$yvar)
+
+dd$Risk <- 'Low'
+dd$Risk[dd$PID %in% rownames(mortality[mortality$Risk == 'High', ])] <- 'High'
+
+p <- ggplot(dd) + geom_line(aes(x=Time, y=Survival, color = Risk, group = PID), linetype = 2) + 
+  labs(title="RSF Predicted Cohort Survival") + 
+  theme(plot.title = element_text(hjust = 0.5), legend.text = element_text(size = 12), 
+        legend.position = c(0.8, 0.85)) +
+  xlab('Time (Months)') + ylab('OOB Survival')
+
+png(paste(date, project, "Round4PredictedSurvival.png", sep = '_'), 
+    width = 5, height = 5, units = 'in', res = 200)
 print(p)
-dev.off()
+dev.off() 
 
-png(paste(date, project, "FinalFeaturesSurvival.png", sep = '_'),
+png(paste(date, project, "Round4_Survival.png", sep = '_'),
     width = 10,
     height = 10,
     units = 'in',
     res = 200)
-plot.survival(rfsrc(Surv(pfs_time, true.progression)~ ., dtaSubset.cli2), cens.model = "rfsrc", collapse = F)
+rv4 <- plot.survival(bestModel.r4, cens.model = "rfsrc", collapse = F) #, subset = subset$Risk == 'High')
 dev.off()
 
 
 
-# test final model on primary/recurrence samples
-feature.to.use <- colnames(dtaSubset.cli2)
-dataPriRecur <- dta %>% filter(Timepoint %in% c('1', 'R')) %>% dplyr::select(all_of(feature.to.use)) 
+# VIMP
+vimpbytreatment <- as.data.frame(vimp(bestModel.r4, block.size = 10, joint = F)$importance)
+colnames(vimpbytreatment) <- "VIMP"
 
-obj.predict5 <- predict(obj.src4, dataPriRecur)
-
-print(obj.predict5)
-yhat <- obj.predict5$predicted
-
-q.yhat <- quantile(yhat, probs = c(0, 0.5, 1))
-q.yhat[1] <- q.yhat[1] - .0001
-Group <- cut(yhat, q.yhat, labels = FALSE)
-
-survDf <- cbind(obj.predict5$yvar, Group)
-survDf$Group[survDf$Group == 1] <- 'LowRisk'
-survDf$Group[survDf$Group == 2] <- 'HighRisk'
-survDf$Group <- factor(survDf$Group, levels = c('LowRisk', 'HighRisk'))
-
-# test 
-dta.pri.rec.AI <- dta %>% filter(drug == 'AI', Timepoint %in% c('1', 'R')) %>% dplyr::select('pcode')
-survDf.Lowrisk <- survDf %>% filter(Group == 'LowRisk')
-
-dta.pri.rec.Ful <- dta %>% filter(drug == 'Fulvestrant', Timepoint %in% c('1', 'R')) %>% dplyr::select('pcode')
-survDf.Highrisk <- survDf %>% filter(Group == 'HighRisk')
-
-setdiff(rownames(dta.pri.rec.Ful), rownames(survDf.Highrisk))
-setdiff(rownames(dta.pri.rec.AI), rownames(survDf.Lowrisk))
-
-p <- make.KM.plot(survDf = survDf, grouping.var = 'Group', surv.type = 'pfs_time', event = 'true.progression')
-
-png(paste(date, project, "TestOfFinalModelOnHtgPriRecurr_PFS_K-M_plot.png", sep = '_'),
-    width = 6, 
-    height = 6, 
-    units = "in", 
-    pointsize = 10, 
-    res = 300
-)
-print(p)
-dev.off()
-
-# OS
-survDf2 <- merge(survDf, dta[, c('os', 'precdk_os_time')], by = 0)
-p <- make.KM.plot(survDf = survDf2, grouping.var = 'Group', surv.type = 'precdk_os_time', event = 'os')
-
-png(paste(date, project, "TestOfFinalModelOnHtgPriRecurr_OS_K-M_plot.png", sep = '_'),
-    width = 6, 
-    height = 6, 
-    units = "in", 
-    pointsize = 10, 
-    res = 300
-)
-print(p)
-dev.off()
+# save variables passing VIMP > 0.002. This should have no effect
+vimp4 <- vimpbytreatment[vimpbytreatment$VIMP > 0.002, , drop = FALSE]
+dim(vimp4)
 
 
-#
-# Test for performance in AI and Fulvestrant treated cohorts separately
-#
-for (drug in c('AI', 'Fulvestrant')){
-    test.df <- dtaSubset.cli2[dtaSubset.cli2$drug == drug, ]
-    obj.predict.drug <- predict(obj.src4, test.df, na.action = "na.impute")
-    
-    print(obj.predict.drug)
-    yhat <- obj.predict.drug$predicted
-    
-    q.yhat <- quantile(yhat, probs = c(0, 0.5, 1))
-    q.yhat[1] <- q.yhat[1] - .0001
-    Group <- cut(yhat, q.yhat, labels = FALSE)
-    
-    survDf <- cbind(obj.predict.drug$yvar, Group)
-    survDf$Group[survDf$Group == 1] <- 'LowRisk'
-    survDf$Group[survDf$Group == 2] <- 'HighRisk'
-    survDf$Group <- factor(survDf$Group, levels = c('LowRisk', 'HighRisk'))
-    
-    p <- make.KM.plot(survDf = survDf, grouping.var = 'Group', surv.type = 'pfs_time', event = 'true.progression')
-    
-    png(paste(date, project, drug, "TestOfFinalModelOnHtgPreTx_PFS_K-M_plot.png", sep = '_'),
-        width = 6, 
-        height = 6, 
-        units = "in", 
-        pointsize = 10, 
-        res = 300
-    )
-    print(p)
-    dev.off()
-    
-    # also test on os
-    survDf2 <- merge(survDf, dta[, c('os', 'precdk_os_time')], by = 0)
-    
-    if (drug == 'AI'){
-        p <- make.KM.plot(survDf = survDf2, grouping.var = 'Group', surv.type = 'precdk_os_time', event = 'os', label.x = 0, label.y = 0.25)
-    } else {
-        p <- make.KM.plot(survDf = survDf2, grouping.var = 'Group', surv.type = 'precdk_os_time', event = 'os')
-    }
-    
-    png(paste(date, project, drug, "TestOfFinalModelOnHtgPreTxPreCDK_OS_K-M_plot.png", sep = '_'),
-        width = 6, 
-        height = 6, 
-        units = "in", 
-        pointsize = 10, 
-        res = 300
-    )
-    print(p)
-    dev.off()
-    
-    png(paste(date, project, drug, "FinalFeaturesSurvival.png", sep = '_'),
-        width = 10,
-        height = 10,
-        units = 'in',
-        res = 200)
-    plot.survival(rfsrc(Surv(pfs_time, true.progression)~ ., test.df), cens.model = "rfsrc", collapse = F)
-    dev.off()
+
+# save to file
+write.table(x = vimp4,
+            file = paste(date, project, 'Round4_FilteredFeatures.csv', sep = '_'),
+            quote = FALSE,
+            sep = ",",
+            row.names = TRUE)
+
+##################################################################################################
+# Make K-M plot to show the RSF performance by stratify patients with OOB predicted mortality
+##################################################################################################
+
+for (dg in c('Combined', 'AI', 'Fulvestrant')){
+  survDf <- bestModel.r4$yvar
+  survDf$OOB_Mortality <- bestModel.r4$predicted.oob
+  survDf$Mortality <- bestModel.r4$predicted
+  
+  # join with OS data
+  survDf <- merge(survDf, dtaPretx[, c(3,5)], by = 0)
+  rownames(survDf) <- survDf$Row.names
+  survDf$Row.names <- NULL
+  
+  if (dg %in% c('AI', 'Fulvestrant')){
+    survDf <- merge(survDf, bestModel.r4$xvar[, 1, drop = FALSE], by = 0)
+    survDfSubset <- survDf %>% filter(drug == dg)
+  } else {
+    survDfSubset <- survDf
+  }
+  
+  survDfSubset$Group <- ifelse(survDfSubset$OOB_Mortality > median(survDfSubset$OOB_Mortality), 'HighRisk', 'LowRisk')
+  survDfSubset$Group <- factor(survDfSubset$Group, levels = c('LowRisk', 'HighRisk'))
+  
+  km <- make.KM.plot(survDf = survDfSubset, grouping.var = 'Group', surv.type = 'pfs_time',
+                     event = 'true.progression', 
+                     legendLabs = c('LowRisk', 'HighRisk'))
+  
+  png(paste(date, project, dg, "Round4_ModelPredictedOobSurvival_PFS_K-M_plot.png", sep = '_'),
+      height = 6,
+      width = 6,
+      units = 'in',
+      res = 100)
+  print(km)
+  dev.off()
+  
+  # overall survival
+  km2 <- make.KM.plot(survDf = survDfSubset, grouping.var = 'Group', surv.type = 'precdk_os_time',
+                     event = 'os', 
+                     legendLabs = c('LowRisk', 'HighRisk'))
+  
+  png(paste(date, project, dg, "Round4_ModelPredictedSurvival_OS_K-M_plot.png", sep = '_'),
+      height = 6,
+      width = 6,
+      units = 'in',
+      res = 100)
+  print(km2)
+  dev.off()
+  
+  # IB data
+  survDfSubset$Group <- ifelse(survDfSubset$Mortality > median(survDfSubset$Mortality), 'HighRisk', 'LowRisk')
+  survDfSubset$Group <- factor(survDfSubset$Group, levels = c('LowRisk', 'HighRisk'))
+  
+  km3 <- make.KM.plot(survDf = survDfSubset, grouping.var = 'Group', surv.type = 'pfs_time',
+                     event = 'true.progression', 
+                     legendLabs = c('LowRisk', 'HighRisk'))
+  
+  png(paste(date, project, dg, "Round4_ModelPredictedIbSurvival_PFS_K-M_plot.png", sep = '_'),
+      height = 6,
+      width = 6,
+      units = 'in',
+      res = 100)
+  print(km3)
+  dev.off()
+  
 }
 
 
-# OS using primary/recurrence samples
-for (drug in c('AI', 'Fulvestrant')){
-    test.df <- dataPriRecur[dataPriRecur$drug == drug, ]
-    obj.predict.drug <- predict(obj.src4, test.df, na.action = "na.impute")
-    
-    print(obj.predict.drug)
-    yhat <- obj.predict.drug$predicted
-    
-    q.yhat <- quantile(yhat, probs = c(0, 0.5, 1))
-    q.yhat[1] <- q.yhat[1] - .0001
-    Group <- cut(yhat, q.yhat, labels = FALSE)
-    
-    survDf <- cbind(obj.predict.drug$yvar, Group)
-    survDf$Group[survDf$Group == 1] <- 'LowRisk'
-    survDf$Group[survDf$Group == 2] <- 'HighRisk'
-    survDf$Group <- factor(survDf$Group, levels = c('LowRisk', 'HighRisk'))
-    
-    p <- make.KM.plot(survDf = survDf, grouping.var = 'Group', surv.type = 'pfs_time', event = 'true.progression')
-    
-    png(paste(date, project, drug, "TestOfFinalModelOnHtgPriRecurr_PFS_K-M_plot.png", sep = '_'),
-        width = 6, 
-        height = 6, 
-        units = "in", 
-        pointsize = 10, 
-        res = 300
-    )
-    print(p)
-    dev.off()
-    
-    # also test on os
-    survDf2 <- merge(survDf, dta[, c('os', 'precdk_os_time')], by = 0)
-    
-    if (drug == 'AI'){
-        p <- make.KM.plot(survDf = survDf2, grouping.var = 'Group', surv.type = 'precdk_os_time', event = 'os', label.x = 0, label.y = 0.25)
-    } else {
-        p <- make.KM.plot(survDf = survDf2, grouping.var = 'Group', surv.type = 'precdk_os_time', event = 'os')
-    }
-    
-    png(paste(date, project, drug, "TestOfFinalModelOnHtgPriRecurr_OS_K-M_plot.png", sep = '_'),
-        width = 6, 
-        height = 6, 
-        units = "in", 
-        pointsize = 10, 
-        res = 300
-    )
-    print(p)
-    dev.off()
+# Best model reduced, i.e. with only the VIMP slected features
+#set.seed(420)
+min.cindex <- 1
+bestModel.reduced <- NULL
+final.features <- rownames(vimp4)
+dtaSubset.final <- dtaSubset.cli2[, c('true.progression', 'pfs_time', final.features)]
+
+for (i in 1:10){
+  ofn <- tune(Surv(pfs_time, true.progression) ~ ., dtaSubset.final)
+
+  #  set.seed(420)
+  obj.src <- rfsrc(Surv(pfs_time, true.progression) ~ ., dtaSubset.final, ntree = 1000,
+                   importance = TRUE, mtry = ofn[[2]][[2]], node.size = ofn[[2]][[1]],
+                   na.action = "na.impute")
+  print(obj.src)
+  sink(file = paste(date, project, 'bestReduced_run', i, 'traing_stats.txt', sep = '_'), append = TRUE, type = 'output')
+  print("BestReduced")
+  print(obj.src)
+  sink()
+
+  #set.seed(420)
+  jk.obj <- subsample(obj.src)
+
+  height <- nrow(vimp4) * 0.24 + 1.3
+  png(paste(date, project, "BestReducedModel_Run", i, "ConfidenceInterval.png", sep = '_'), width = 5, height = height, units = 'in', res = 100)
+  par(oma=c(1,1,1,1))
+  par(mar=c(4,6,2,2) + 0.1)
+  plot(jk.obj, cex = 1.2)
+  dev.off()
+
+  # get OOB perforance error for best model selection
+  cindex <- get.cindex(time = dtaSubset.final$pfs_time, censoring = dtaSubset.final$true.progression,
+                       predicted = obj.src$predicted.oob)
+  #rankings <- c(rankings, cindex)
+  if (cindex < min.cindex){
+    min.cindex <- cindex
+    bestModel.reduced <- obj.src
+  }
+}
+
+# plot OOB predicted survival function stratify patients by median dichotimze mortality score
+pred.surv =  as.data.frame(t(bestModel.reduced$survival.oob))
+colnames(pred.surv) <- rownames(bestModel.reduced$xvar)
+pred.surv$Time <- bestModel.reduced$time.interest
+
+dd = melt(pred.surv, id=c("Time"))
+colnames(dd) <- c('Time', 'PID', 'Survival')
+
+mortality <- data.frame(Mortality = bestModel.reduced$predicted.oob)
+mortality$Risk <- ifelse(mortality$Mortality > median(mortality$Mortality), 'High', 'Low')
+rownames(mortality) <- rownames(bestModel.reduced$yvar)
+
+dd$Risk <- 'Low'
+dd$Risk[dd$PID %in% rownames(mortality[mortality$Risk == 'High', ])] <- 'High'
+
+p <- ggplot(dd) + geom_line(aes(x=Time, y=Survival, color = Risk, group = PID), linetype = 2) + 
+  labs(title="RSF Predicted Cohort Survival") + 
+  theme(plot.title = element_text(hjust = 0.5), legend.text = element_text(size = 12), 
+        legend.position = c(0.8, 0.85)) +
+  xlab('Time (Months)') + ylab('OOB Survival')
+
+png(paste(date, project, "FinalRoundPredictedSurvival.png", sep = '_'), 
+    width = 5, height = 5, units = 'in', res = 200)
+print(p)
+dev.off() 
+
+png(paste(date, project, "FinalRound_Survival.png", sep = '_'),
+    width = 10,
+    height = 10,
+    units = 'in',
+    res = 200)
+rv5 <- plot.survival(bestModel.reduced, cens.model = "rfsrc", collapse = F) 
+dev.off()
+
+
+##################################################################################################
+# Make K-M plot to show the RSF performance by stratify patients with OOB predicted mortality for
+# bestModel reduced
+##################################################################################################
+
+for (dg in c('Combined', 'AI', 'Fulvestrant')){
+  survDf <- bestModel.reduced$yvar
+  survDf$OOB_Mortality <- bestModel.reduced$predicted.oob
+  survDf$Mortality <- bestModel.reduced$predicted
+  
+  # join with OS data
+  survDf <- merge(survDf, dtaPretx[, c(3,5)], by = 0)
+  rownames(survDf) <- survDf$Row.names
+  survDf$Row.names <- NULL
+  
+  if (dg %in% c('AI', 'Fulvestrant')){
+    survDf <- merge(survDf, bestModel.reduced$xvar[, 1, drop = FALSE], by = 0)
+    survDfSubset <- survDf %>% filter(drug == dg)
+  } else {
+    survDfSubset <- survDf
+  }
+  
+  survDfSubset$Group <- ifelse(survDfSubset$OOB_Mortality > median(survDfSubset$OOB_Mortality), 'HighRisk', 'LowRisk')
+  survDfSubset$Group <- factor(survDfSubset$Group, levels = c('LowRisk', 'HighRisk'))
+  
+  km <- make.KM.plot(survDf = survDfSubset, grouping.var = 'Group', surv.type = 'pfs_time',
+                     event = 'true.progression', 
+                     legendLabs = c('LowRisk', 'HighRisk'))
+  
+  png(paste(date, project, dg, "ReducedBestModelPredictedOobSurvival_PFS_K-M_plot.png", sep = '_'),
+      height = 6,
+      width = 6,
+      units = 'in',
+      res = 100)
+  print(km)
+  dev.off()
+  
+  # overall survival
+  km2 <- make.KM.plot(survDf = survDfSubset, grouping.var = 'Group', surv.type = 'precdk_os_time',
+                      event = 'os', 
+                      legendLabs = c('LowRisk', 'HighRisk'))
+  
+  png(paste(date, project, dg, "ReducedBestFModelPredictedSurvival_OS_K-M_plot.png", sep = '_'),
+      height = 6,
+      width = 6,
+      units = 'in',
+      res = 100)
+  print(km2)
+  dev.off()
+  
+  # IB data
+  survDfSubset$Group <- ifelse(survDfSubset$Mortality > median(survDfSubset$Mortality), 'HighRisk', 'LowRisk')
+  survDfSubset$Group <- factor(survDfSubset$Group, levels = c('LowRisk', 'HighRisk'))
+  
+  km3 <- make.KM.plot(survDf = survDfSubset, grouping.var = 'Group', surv.type = 'pfs_time',
+                     event = 'true.progression', 
+                     legendLabs = c('LowRisk', 'HighRisk'))
+  
+  png(paste(date, project, dg, "ReducedBestModelPredictedIbSurvival_PFS_K-M_plot.png", sep = '_'),
+      height = 6,
+      width = 6,
+      units = 'in',
+      res = 100)
+  print(km3)
+  dev.off()
+  
 }
 
 
 ##=======================================================================================
 ## Scatter plot to show correlation of mortality with actual PFS time
 ##=======================================================================================
-data.for.scatterplot <- data.frame(Mortality = obj.predict4$predicted, PFS_time = dtaSubset.cli2$pfs_time, 
-                                   Status = ifelse(dtaSubset.cli2$true.progression == 0, 'Censored', 'Event'))
+data.for.scatterplot <- data.frame(Mortality = bestModel.reduced$predicted.oob, PFS_time = dtaSubset.final$pfs_time, 
+                                   Status = ifelse(dtaSubset.final$true.progression == 0, 'Censored', 'Event'),
+                                   Sample = rownames(bestModel.reduced$yvar))
 
-p <- ggscatter(data.for.scatterplot, x = "PFS_time", y = "Mortality",  
-               color = "Status", shape = 21, size = 2, # Points color, shape and size
+
+# Some patients progressed since last follow up, so plot them on top of the above plot and see if
+# the new data point are moving closer to the trend line
+data.for.scatterplot$pcode <- sub('^(P\\d+).*', '\\1', data.for.scatterplot$Sample)
+
+
+p <- ggscatter(data.for.scatterplot, x = "PFS_time", y = "Mortality",  shape = 'Status',
+               color = "Status", bg = 'black', fill = 'Status', size = ifelse(data.for.scatterplot$Status == 'NewlyProgressed', 3, 1.5), # Points color, shape and size
                add = "reg.line",  # Add regressin line
                add.params = list(color = "blue", fill = "lightgray"), # Customize reg. line
                conf.int = TRUE, # Add confidence interval
                cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
-               cor.coeff.args = list(method = "pearson", label.x = 20, label.sep = "\n")
+               cor.coeff.args = list(method = "pearson", label.x = 50, label.sep = "\n")
 )
-
-png(paste(date, project, "PredictedMortality_vs_PFS_on_HTG_preTX.png", sep = '_'),
+p <- p + scale_shape_manual(values = c(1, 2, 8)) # + geom_point(data = newlyProgressed, aes(x=PFS_time,y=Mortality),colour="purple", shape = 9, size = 3)
+p <- p + ylab('OOB Mortality')
+png(paste(date, project, "OOB_PredictedMortality_vs_PFS_on_RPCI_preTX.png", sep = '_'),
     width = 5,
     height = 5,
+    units = 'in',
+    res = 150
+)
+print(p)
+dev.off()
+
+
+# boxplot to show difference of predicted mortality for very short PFS (intrinsic resistance) and very long PFS patients
+data.for.boxplot <- data.for.scatterplot %>% filter(PFS_time > 25 | Status == 'Event'& PFS_time < 6)
+data.for.boxplot$Response <- ifelse(data.for.boxplot$PFS_time < 6, 'Resistant', 'Responsive')
+data.for.boxplot$Response <- factor(data.for.boxplot$Response, levels = c('Resistant', 'Responsive'))
+
+p <- ggboxplot(data.for.boxplot, x = "Response", y = "Mortality",
+               color = "Response", palette = "jco",
+               add = "jitter") + theme(legend.position="none", axis.title.x = element_blank()) +
+  ylab('OOB Predicted Mortality') + stat_compare_means(method = "t.test")
+
+png(paste(date, project, "OOB_PredictedMortalityResistantVsReponsivePfsRPCI_Boxplot.png", sep = '_'),
+    width = 3,
+    height = 4,
     units = 'in',
     res = 200
 )
 print(p)
 dev.off()
+
+
+# use (IB) predicted results on the whole ensemble
+
+data.for.scatterplot2 <- data.frame(Mortality = bestModel.reduced$predicted, PFS_time = dtaSubset.final$pfs_time, 
+                                   Status = ifelse(dtaSubset.final$true.progression == 0, 'Censored', 'Event'),
+                                   #Status2 = bestModel.reduced$event.info$cens,
+                                   Sample = rownames(bestModel.reduced$yvar))
+
+
+p2 <- ggscatter(data.for.scatterplot2, x = "PFS_time", y = "Mortality",  shape = 'Status',
+                color = "Status", bg = 'black', fill = 'Status', size =  1.5, # Points color, shape and size
+                add = "reg.line",  # Add regressin line
+                add.params = list(color = "blue", fill = "lightgray"), # Customize reg. line
+                conf.int = TRUE, # Add confidence interval
+                cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+                cor.coeff.args = list(method = "pearson", label.x = 50, label.sep = "\n")
+)
+p2 <- p2 + scale_shape_manual(values = c(1, 2, 8)) # + geom_point(data = newlyProgressed, aes(x=PFS_time,y=Mortality),colour="purple", shape = 9, size = 3)
+p2 <- p2 + ylab('Mortality')
+png(paste(date, project, "PredictedMortality_vs_PFS_on_RPCI_preTX.png", sep = '_'),
+    width = 5,
+    height = 5,
+    units = 'in',
+    res = 150
+)
+print(p2)
+dev.off()
+
+data.for.boxplot2 <- data.for.scatterplot2 %>% filter(PFS_time > 25 | Status2 == 'Event' & PFS_time < 6)
+data.for.boxplot2$Response <- ifelse(data.for.boxplot2$PFS_time < 6, 'Resistant', 'Responsive')
+data.for.boxplot2$Response <- factor(data.for.boxplot2$Response, levels = c('Resistant', 'Responsive'))
+
+p2 <- ggboxplot(data.for.boxplot2, x = "Response", y = "Mortality",
+               color = "Response", palette = "jco",
+               add = "jitter") + theme(legend.position="none", axis.title.x = element_blank()) +
+  ylab('Predicted Mortality') + stat_compare_means(method = "t.test", label.x = 1.5)
+
+png(paste(date, project, "PredictedMortalityResistantVsResponsivePfsRPCI_Boxplot.png", sep = '_'),
+    width = 3,
+    height = 4,
+    units = 'in',
+    res = 200
+)
+print(p2)
+dev.off()
+
 
 ##=======================================================================================
 ## Validation on NeoPalAna dataset which are treated with AI + Palbo. This dataset has no
@@ -685,7 +1002,7 @@ obj.src5 <- rfsrc(Surv(pfs_time, true.progression) ~ ., dtaSubset.neopalana, ntr
 print(obj.src5)
 # (OOB) Requested performance error: 0.38341323
 
-save(obj.src5, file = 'RSFModelNoClinical.Rdata')
+#save(obj.src5, file = paste(date, project, 'RSFModelNoClinical.Rdata', sep = '_'))
 
 # This dataset was treated with AI like drug, so add the drug column
 c0d1$drug <- 'AI'
@@ -701,7 +1018,7 @@ colnames(dd) <- c('Time', 'PID', 'Survival')
 
 dd$PID <- as.character(dd$PID)
 
-dd$Response <- 'Sensitive'
+dd$Response <- 'Responsive'
 dd$Response[dd$PID %in% resistantPids] <- 'Resistant'
 
 p <- ggplot(dd) + geom_line(aes(x=Time, y=Survival, color = Response, group = PID), linetype = 2) + 
@@ -714,6 +1031,65 @@ png(paste(date, project, "NeoPalAnaPredictedSurvival.png", sep = '_'),
     width = 5, height = 5, units = 'in', res = 200)
 print(p)
 dev.off() 
+
+
+#
+# Kolmogorov-Smirnov test to show CDK4/6i resistant tumors are skewed toward the short PFS end
+#
+
+# Use PFS probability values at 40 months (arbitrary, at this time point, we see good sevaration of the lines)
+data.for.ks <- dd %>% filter(Time > 30, Time < 30.2)
+
+# order by PFS time in increasing order
+data.for.ks <- data.for.ks %>% arrange(Survival)
+data.for.ks$rank <- 1:nrow(data.for.ks)
+
+x = which(data.for.ks$Response == 'Resistant')
+ks.test(x = x, y = data.for.ks$rank, alternative = 'greater')
+
+# Exact two-sample Kolmogorov-Smirnov test
+# 
+# data:  x and data.for.ks$rank
+# D^+ = 0.71875, p-value = 0.004857
+# alternative hypothesis: the CDF of x lies above that of y
+
+
+# Heatmap to show distribution
+data.for.ks$Response2 <- ifelse(data.for.ks$Response == 'Resistant', 1, 0)
+rownames(data.for.ks) <- data.for.ks$PID
+
+
+response.color <- c('red', 'blue')
+names(response.color) <- c('Resistant', 'Responsive')
+
+
+dummy.data <- data.frame(dummy = rep(0, nrow(data.for.ks)))
+rownames(dummy.data) <- data.for.ks$PID
+
+ha <- HeatmapAnnotation(Response = data.for.ks$Response,
+                        Survival = data.for.ks$Survival,
+                        col = list(Response = response.color, Survival = colorRamp2(c(0, 0.25), c("white", "purple"))),
+                        annotation_name_gp= gpar(fontsize = 12, fontface = 'bold'))
+ht <- Heatmap(t(dummy.data),
+              cluster_rows = FALSE,
+              cluster_columns = FALSE,
+              show_row_dend = FALSE,
+              show_column_dend = FALSE,
+              show_column_names = TRUE,
+              show_row_names = FALSE,
+              show_heatmap_legend = FALSE,
+              bottom_annotation = ha,
+              col = 'white',
+              )
+
+png(paste(date, project, "Neopalana_KS.png", sep = '_'),
+    width = 7,
+    height = 3,
+    units = 'in',
+    res = 100)
+print(ht)
+dev.off()
+
 
 ##===========================================================================================================
 ## Testing for predictive and prognostic power on Metabric dataset. If it has discriminating power, that 
@@ -897,27 +1273,13 @@ expRawList[['PEARL']] <- expRawPl
 # Will be replaced with the original data
 expRawList[['Metabric']] <- metabric.for.aims
 
-# use raw count of HTG data for subtype prediction
-htgRaw <- read.csv('/mnt/Jason/HTG/data/all.raw.htg+clinical.batch.1-5.csv')
-
-# Remove P6, bone Run1 as it was sent twice. Keep the second one. There is no clear reason to keep the second one
-htgRaw <- htgRaw %>% filter(!(pcode == 'P6' & Organ == 'Bone'& batch == 'Run1'))
-
-rownames(htgRaw) <- paste(htgRaw$pcode, htgRaw$Block, htgRaw$Timepoint, htgRaw$Organ, sep = '|')
-
-htgRaw <- htgRaw[htgRaw$drug %in% c('AI', 'Fulvestrant'), ]
-
-# only use pretreatment samples
-htgRawPreTx <- htgRaw %>% filter(Timepoint == '2')
-
-expRawList[['HTG']] <- as.data.frame(t(htgRawPreTx[, 17:ncol(htgRawPreTx)]))
 
 expNormList <- list()
 expNormList[['PALOMA-2']] <- expNormP2
 expNormList[['PALOMA-3']] <- expNormP3
 expNormList[['PEARL']] <- expNormPl
 expNormList[['Metabric']] <- as.data.frame(t(metabricSubset[, 39:ncol(metabricSubset)]))
-expNormList[['HTG']] <- as.data.frame(t(dtaPretx[, 18:ncol(dtaPretx)]))
+#expNormList[['HTG']] <- as.data.frame(t(dtaPretx[, 18:ncol(dtaPretx)]))
 
 #
 # Map Entrez gene id to express matrix. This is needed by AIMS
@@ -942,10 +1304,6 @@ subtypeList <- list()
 for (ds in names(expRawList)){
     expRaw <- expRawList[[ds]]
     
-    # remov NA columns
-    #na.col <- apply(expRaw, 2, sum)
-    #expRaw <- expRaw[, !is.na(na.col)]
-    
     # add Entrez gene ID as required by AIMS
     expRaw <- merge(id2symbol, expRaw, by = 0)
     expRaw <- expRaw[!duplicated(expRaw$gene_id),]
@@ -966,30 +1324,44 @@ for (ds in names(expRawList)){
 
 
 # Since clinical variables not present in testing ds (expcept for HTG), so train a new model without them
-train.paloma <- dtaSubset.cli2[, !colnames(dtaSubset.cli2) %in% clinical.variables]
+train.paloma <- dtaSubset.final[, !colnames(dtaSubset.final) %in% c('cdk_prior_et', 'Organ')]
 
-o7 <- tune(Surv(pfs_time, true.progression) ~ ., train.paloma)
+# repeat 5 times and get the best model
+bestModel.paloma <- NULL
+min.cindex <- 1
 
-obj.src.paloma <- rfsrc(Surv(pfs_time, true.progression) ~ ., train.paloma, ntree = 3000, 
-                         importance = TRUE, mtry = o7[[2]][[2]], node.size = o7[[2]][[1]],
-                         na.action = "na.impute")
-print(obj.src.paloma)
-
+for (i in 1:5){
+  o7 <- tune(Surv(pfs_time, true.progression) ~ ., train.paloma)
+  
+  obj.src.paloma <- rfsrc(Surv(pfs_time, true.progression) ~ ., train.paloma, ntree = 3000, 
+                          importance = TRUE, mtry = o7[[2]][[2]], node.size = o7[[2]][[1]],
+                          na.action = "na.impute")
+  print(obj.src.paloma)
+  
+  # get OOB perforance error for best model selection
+  cindex <- get.cindex(time = train.paloma$pfs_time, censoring = train.paloma$true.progression,
+                       predicted = obj.src.paloma$predicted.oob)
+  #rankings <- c(rankings, cindex)
+  if (cindex < min.cindex){
+    min.cindex <- cindex
+    bestModel.paloma <- obj.src.paloma
+  }
+}
 
 for (ds in names(subtypeList)){
     subtype.df <- subtypeList[[ds]]
     
     test.df <- expNormList[[ds]]
     
-    test.df <- test.df[rownames(test.df) %in% obj.src.paloma$xvar.names, ]
+    test.df <- test.df[rownames(test.df) %in% bestModel.paloma$xvar.names, ]
     test.df <- as.data.frame(t(scale(test.df)))
     
     if (ds == "PALOMA-2"){
         test.df$drug <- 'AI'
-        ds.predict <- predict(obj.src.paloma, test.df, na.action = 'na.impute')
+        ds.predict <- predict(bestModel.paloma, test.df, na.action = 'na.impute')
     } else if (ds %in% c("PALOMA-3", "PEARL")) {
         test.df$drug <- 'Fulvestrant'
-        ds.predict <- predict(obj.src.paloma, test.df, na.action = 'na.impute')
+        ds.predict <- predict(bestModel.paloma, test.df, na.action = 'na.impute')
     } else if (ds == "Metabric"){
         test.df$drug <- 'AI'
         ds.predict <- predict(obj.src.metabric, test.df, na.action = 'na.impute')
@@ -1120,6 +1492,143 @@ for (ds in names(subtypeList)){
     dev.off()
 }
 
+# Plot OOR performance error for each marker
+stat.files <- list.files('.', pattern = 'stats.txt')
+stat.files <- stat.files[!grepl('ElasticNetSignature', stat.files)]
+data.for.barplot <- NULL
+
+for (file in stat.files){
+  
+  tmp <- read.csv(file, sep = ':')
+  rownames(tmp) <- sub('^\\s+', '', rownames(tmp))
+  colnames(tmp) <- sub('X\\.1\\.\\.', '', colnames(tmp))
+  tmp[[1]] <- sub('\\s+', '', tmp[[1]])
+  
+  tmp2 <- data.frame(OOB_error = tmp['(OOB) Requested performance error', ], Marker = colnames(tmp)[1])
+  if (is.null(data.for.barplot)){
+    data.for.barplot <- tmp2
+  } else {
+  data.for.barplot <- rbind(data.for.barplot, tmp2)
+  }
+}
+
+#============================================================================================
+# Plot predicted mortality for PALOMA2/3 and PEARL and test for concordance
+#============================================================================================
+paloma2.exp <- expNormP2[rownames(expNormP2) %in% bestModel.paloma$xvar.names, ]
+paloma2.exp <- as.data.frame(t(scale(paloma2.exp)))
+paloma2.exp$drug <- 'AI'
+rownames(paloma2.exp) <- paste('PALOMA2', rownames(paloma2.exp))
+
+
+# PALOMA3
+paloma3.exp <- expNormP3[rownames(expNormP3) %in% bestModel.paloma$xvar.names, ]
+paloma3.exp <- as.data.frame(t(scale(paloma3.exp)))
+paloma3.exp$drug <- 'Fulvestrant'
+rownames(paloma3.exp) <- paste('PALOMA3', rownames(paloma3.exp))
+
+
+# PEARL
+pearl.exp <- expNormPl[rownames(expNormPl) %in% bestModel.paloma$xvar.names, ]
+pearl.exp <- as.data.frame(t(scale(pearl.exp)))
+pearl.exp$drug <- 'Fulvestrant'
+rownames(pearl.exp) <- paste('PEARL', rownames(pearl.exp))
+
+# boxplot to show difference predicted mortality
+externalTesting <- rbind(paloma2.exp, paloma3.exp, pearl.exp)
+external.predict <- predict(bestModel.paloma, externalTesting, na.action = 'na.impute')
+palPearlMort <- external.predict$predicted
+
+data.to.plot <- data.frame(Mortality =  palPearlMort,
+                           Source = sub(' .*$', '', rownames(external.predict$xvar)))
+
+data.to.plot$Source <- factor(data.to.plot$Source, levels = c('PALOMA2', 'PALOMA3', 'PEARL'))
+
+my_comparisons <- list( c("PALOMA2", "PALOMA3"), c("PALOMA2", "PEARL"), c("PALOMA3", "PEARL") )
+p <- ggboxplot(data.to.plot, x = "Source", y = "Mortality",
+               color = "Source", 
+               palette = "jco",
+               
+               add = "jitter") + stat_compare_means(comparisons = my_comparisons) + 
+  stat_compare_means(label.y = 50)  +
+    theme(legend.position="none", axis.title.x = element_blank()) + scale_color_manual(values=c('PALOMA2' = 'red', 'PALOMA3' = 'green', PEARL = 'blue'))
+
+png(paste(date, project, "PredictedMortalityPalomaPearlBoxplot.png", sep = '_'),
+    width = 4,
+    height = 5,
+    units = 'in',
+    res = 200
+    )
+print(p)
+dev.off()
+
+# Plot predicted survival functions for the three dataset together
+externalTesting <- rbind(paloma2.exp, paloma3.exp, pearl.exp)
+external.predict <- predict(bestModel.paloma, externalTesting, na.action = 'na.impute')
+
+pred.surv = t(external.predict$survival)
+colnames(pred.surv) <- rownames(external.predict$xvar)
+pred.surv <- as.data.frame(pred.surv)
+pred.surv$Time <- external.predict$time.interest
+
+dd = melt(pred.surv, id=c("Time"))
+colnames(dd) <- c('Time', 'PID', 'Survival')
+
+dd$PID <- as.character(dd$PID)
+
+dd$Study <- 'PEARL'
+dd$Study[dd$PID %in% rownames(paloma2.exp)] <- 'PALOMA2'
+dd$Study[dd$PID %in% rownames(paloma3.exp)] <- 'PALOMA3'
+
+
+p <- ggplot() + geom_line(data = dd, aes(x=Time, y=Survival, color = Study, group = PID, alpha = Study), linetype = 2) +
+  labs(title="RSF Predicted Survival on PALOMA2/3 and PEARL Study") +
+  theme(plot.title = element_text(hjust = 0.5), legend.text = element_text(size = 12),
+        legend.position = c(0.8, 0.8)) + scale_alpha_manual(values=c(1, 0.2, 0.1)) + 
+  xlab('Time (Months)') + ylab('PFS Probability')
+
+png(paste(date, project, "PredictedSurvivalFuncitonForPaloma2.png", sep = '_'),
+    width = 5.5, height = 5.5, units = 'in', res = 150)
+print(p)
+dev.off()
+
+
+
+
+#============================================================================================
+# Plot OOB Requested performance error for each iteration
+#============================================================================================
+data.for.barplot$OOB_error <- as.numeric(data.for.barplot$OOB_error)
+
+# average values for each round
+data.for.barplot <- data.for.barplot %>%  group_by(Marker) %>%  summarise(OOB_error = mean(OOB_error))
+
+data.for.barplot$Marker[data.for.barplot$Marker == 'BestReduced'] <- 'Final'
+data.for.barplot$Iteration <- "FirstRounds"
+data.for.barplot$Iteration[grepl('Round|Final', data.for.barplot$Marker)] <- 'LaterRounds'
+data.for.barplot$Marker <- factor(data.for.barplot$Marker, levels = c("BCI", "CDK2", "CDK46", "EndoPredict",
+                                                                      "G2M_Checkpoint", "IHC4", "Mammaprint",  
+                                                                      "Mammostrat", "OncotypeDX","PALOMA23",
+                                                                      "PALOMA3","PAM50", "PEARL", "Proliferation", "RBSig",       
+                                                                      "Round2", "Round3", "Round4", "Final"))
+
+p <- ggplot(data.for.barplot, aes(x = Marker, y = OOB_error, fill = Iteration)) + geom_bar(width = 0.5, stat="identity")
+p <- p + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+p <- p + ylab('(OOB) Requsted performance error')
+png(paste(date, project, "OOB_error_over_iteration.png", sep = '_'),
+    height = 4,
+    width = 5,
+    units = 'in',
+    res = 200)
+print(p)
+dev.off()
+
+# save workspace
+save.image(paste(date, project, "Workspace.RData", sep = '_'))
+
+# Need to fix the renaming probelm for rerun later on with the May 07 data
+#bestModelList.r1 <- bestModels.r1
 
 #### WRITE SESSION INFO TO FILE ####################################################################
 writeLines(capture.output(sessionInfo()), paste(date, project, "SessionInfo.txt", sep = '_'))
+
